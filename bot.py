@@ -1,12 +1,103 @@
 import os
 import sqlite3
-from urllib.parse import quote_plus
+import asyncio
+import re
+from html.parser import HTMLParser
+from urllib.parse import quote_plus, urlparse, parse_qs, unquote
+from urllib.request import Request, urlopen
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
 DB_PATH = os.getenv("BOT_DB_PATH", "bot.db")
+
+
+
+class SearchResultsParser(HTMLParser):
+    """Extract public result titles, URLs and snippets from DuckDuckGo HTML."""
+    def __init__(self):
+        super().__init__()
+        self.results = []
+        self.current = None
+        self.capture = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        classes = attrs.get("class", "")
+        if tag == "a" and "result__a" in classes:
+            if self.current and self.current.get("title"):
+                self.results.append(self.current)
+            self.current = {"title": "", "url": attrs.get("href", ""), "snippet": ""}
+            self.capture = "title"
+        elif self.current and tag in ("a", "div") and "result__snippet" in classes:
+            self.capture = "snippet"
+
+    def handle_data(self, data):
+        if self.current and self.capture in ("title", "snippet"):
+            self.current[self.capture] += data
+
+    def handle_endtag(self, tag):
+        if self.current and tag == "a" and self.capture == "title":
+            self.capture = None
+        if self.current and tag == "div" and self.capture == "snippet":
+            self.capture = None
+
+    def handle_startendtag(self, tag, attrs):
+        pass
+
+    def close(self):
+        super().close()
+        if self.current and self.current.get("title"):
+            self.results.append(self.current)
+            self.current = None
+
+
+def fetch_public_results(query, limit=5):
+    """Fetch publicly indexed web results; no private Telegram data is accessed."""
+    url = "https://html.duckduckgo.com/html/?q=" + quote_plus(query)
+    request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urlopen(request, timeout=12) as response:
+        html = response.read().decode("utf-8", errors="replace")
+    parser = SearchResultsParser()
+    parser.feed(html)
+    parser.close()
+
+    results = []
+    for item in parser.results:
+        link = item["url"]
+        parsed = urlparse(link)
+        if "duckduckgo.com" in parsed.netloc:
+            target = parse_qs(parsed.query).get("uddg", [""])[0]
+            if target:
+                link = unquote(target)
+        if not link.startswith(("http://", "https://")):
+            continue
+        title = re.sub(r"\s+", " ", item["title"]).strip()
+        snippet = re.sub(r"\s+", " ", item["snippet"]).strip()
+        results.append((title[:180], link, snippet[:350]))
+        if len(results) >= limit:
+            break
+    return results
+
+
+async def send_search_results(update, query, heading):
+    await update.message.reply_text(f"ð {heading}\nSearching public web indexesâ¦")
+    try:
+        results = await asyncio.to_thread(fetch_public_results, query, 5)
+    except Exception:
+        results = []
+
+    if not results:
+        await update.message.reply_text(
+            "I couldn't retrieve readable results right now. The public search service may be unavailable. "
+            "Try again later."
+        )
+        return
+
+    for index, (title, link, snippet) in enumerate(results, 1):
+        text = f"{index}. {title}\n{snippet or 'No preview available.'}\n{link}"
+        await update.message.reply_text(text, disable_web_page_preview=True)
 
 
 def db():
@@ -88,19 +179,9 @@ async def groupsearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /groupsearch Data Sale Ireland")
         return
     query = " ".join(context.args).strip()
-    q = quote_plus(query + " Telegram group")
-    q_tme = quote_plus(query + " site:t.me")
-    q_tgstat = quote_plus(query)
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Search public Telegram links", url=f"https://www.google.com/search?q={q_tme}")],
-        [InlineKeyboardButton("Search the web", url=f"https://www.google.com/search?q={q}")],
-        [InlineKeyboardButton("Search TGStat directory", url=f"https://tgstat.com/search?query={q_tgstat}")],
-    ])
-    await update.message.reply_text(
-        f"ð Public group search for: {query}\n\n"
-        "These links search public listings and indexed pages. Results may be incomplete or outdated; "
-        "check the group name, description, and invite link before joining.",
-        reply_markup=keyboard
+    await send_search_results(
+        update, f'"{query}" Telegram public group',
+        f"Public Telegram group search for: {query}"
     )
 
 
@@ -112,18 +193,9 @@ async def publicsearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not username or any(ch.isspace() for ch in username):
         await update.message.reply_text("Please provide one Telegram username, e.g. /publicsearch @example")
         return
-    exact = quote_plus('"@' + username + '" Telegram')
-    tme = quote_plus('"' + username + '" site:t.me')
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Open Telegram profile", url=f"https://t.me/{quote_plus(username)}")],
-        [InlineKeyboardButton("Search public web mentions", url=f"https://www.google.com/search?q={exact}")],
-        [InlineKeyboardButton("Search public Telegram links", url=f"https://www.google.com/search?q={tme}")],
-    ])
-    await update.message.reply_text(
-        f"ð Public search links for @{username}\n\n"
-        "This can find indexed public mentions or links, but it cannot list every group a person belongs to. "
-        "Private memberships and private account information are not accessible.",
-        reply_markup=keyboard
+    await send_search_results(
+        update, f'"@{username}" Telegram',
+        f"Public web mentions for @{username}"
     )
 
 
@@ -135,19 +207,14 @@ async def groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not username or any(ch.isspace() for ch in username):
         await update.message.reply_text("Enter one valid username.")
         return
-    q1 = quote_plus(f'"{username}" site:t.me')
-    q2 = quote_plus(f'"@{username}" Telegram group')
-    q3 = quote_plus(username)
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Search public Telegram links", url=f"https://www.google.com/search?q={q1}")],
-        [InlineKeyboardButton("Search public group mentions", url=f"https://www.google.com/search?q={q2}")],
-        [InlineKeyboardButton("Check TGStat", url=f"https://tgstat.com/search?query={q3}")]
-    ])
+    query = f'"{username}" (site:t.me OR Telegram group)'
+    await send_search_results(
+        update, query,
+        f"Publicly indexed group references for @{username}"
+    )
     await update.message.reply_text(
-        f"ð Public group references for @{username}\n\n"
-        "These searches may find public group links or mentions. A mention does not prove membership. "
-        "Private groups cannot be checked.",
-        reply_markup=keyboard
+        "Note: these are public web-index results only. A mention or link does not prove "
+        "that the account is a member of a group. Private memberships cannot be checked."
     )
 
 
