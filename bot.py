@@ -1,11 +1,13 @@
 import os
 import sqlite3
-from telegram import Update
+from urllib.parse import quote_plus
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
 DB_PATH = os.getenv("BOT_DB_PATH", "bot.db")
+
 
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -23,21 +25,20 @@ def db():
             added_by_admin INTEGER DEFAULT 0
         )
     """)
-    # Upgrade an existing database created by the earlier bot.
     existing = {r[1] for r in conn.execute("PRAGMA table_info(profiles)")}
     for name, definition in [
-        ("country", "TEXT DEFAULT ''"),
-        ("city", "TEXT DEFAULT ''"),
-        ("occupation", "TEXT DEFAULT ''"),
-        ("public_links", "TEXT DEFAULT ''"),
+        ("country", "TEXT DEFAULT ''"), ("city", "TEXT DEFAULT ''"),
+        ("occupation", "TEXT DEFAULT ''"), ("public_links", "TEXT DEFAULT ''"),
         ("added_by_admin", "INTEGER DEFAULT 0"),
     ]:
         if name not in existing:
             conn.execute(f"ALTER TABLE profiles ADD COLUMN {name} {definition}")
     return conn
 
+
 def is_admin(update: Update) -> bool:
     return bool(ADMIN_USER_ID and str(update.effective_user.id) == ADMIN_USER_ID)
+
 
 def profile_text(row):
     user_id, username, name, bio, groups, country, city, occupation, links = row
@@ -52,40 +53,91 @@ def profile_text(row):
             lines.append(f"{label}: {value}")
     return "\n".join(lines)
 
+
 SELECT_FIELDS = """user_id, username, display_name, bio, public_groups,
                    country, city, occupation, public_links"""
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_line = "\n/addprofile â add a profile (admin only)" if is_admin(update) else ""
     await update.message.reply_text(
-        "ð Public Profile Directory\n\n"
+        "ð Public Profile Directory & Public Search\n\n"
         "/register â save your own profile\n"
         "/lookup <username-or-ID> â search saved profiles\n"
+        "/groupsearch <keywords> â find public Telegram group search results\n"
+        "/publicsearch <username> â search public web mentions of a username\n"
         "/myprofile â view your profile\n"
         "/deleteprofile â delete your own profile\n"
         "/myid â show your Telegram numeric ID"
         f"{admin_line}\n\n"
-        "Only information voluntarily provided or shared with permission is stored. "
-        "Do not submit private contact details, passwords, or sensitive information."
+        "Public search opens search pages; it does not reveal private group memberships, phone numbers, or private chats. "
+        "Only submit information voluntarily provided or clearly public."
     )
+
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
+
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Your Telegram numeric ID is: {update.effective_user.id}")
 
+
+async def groupsearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /groupsearch Data Sale Ireland")
+        return
+    query = " ".join(context.args).strip()
+    q = quote_plus(query + " Telegram group")
+    q_tme = quote_plus(query + " site:t.me")
+    q_tgstat = quote_plus(query)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Search public Telegram links", url=f"https://www.google.com/search?q={q_tme}")],
+        [InlineKeyboardButton("Search the web", url=f"https://www.google.com/search?q={q}")],
+        [InlineKeyboardButton("Search TGStat directory", url=f"https://tgstat.com/search?query={q_tgstat}")],
+    ])
+    await update.message.reply_text(
+        f"ð Public group search for: {query}\n\n"
+        "These links search public listings and indexed pages. Results may be incomplete or outdated; "
+        "check the group name, description, and invite link before joining.",
+        reply_markup=keyboard
+    )
+
+
+async def publicsearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /publicsearch @username")
+        return
+    username = context.args[0].strip().lstrip("@")
+    if not username or any(ch.isspace() for ch in username):
+        await update.message.reply_text("Please provide one Telegram username, e.g. /publicsearch @example")
+        return
+    exact = quote_plus('"@' + username + '" Telegram')
+    tme = quote_plus('"' + username + '" site:t.me')
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Open Telegram profile", url=f"https://t.me/{quote_plus(username)}")],
+        [InlineKeyboardButton("Search public web mentions", url=f"https://www.google.com/search?q={exact}")],
+        [InlineKeyboardButton("Search public Telegram links", url=f"https://www.google.com/search?q={tme}")],
+    ])
+    await update.message.reply_text(
+        f"ð Public search links for @{username}\n\n"
+        "This can find indexed public mentions or links, but it cannot list every group a person belongs to. "
+        "Private memberships and private account information are not accessible.",
+        reply_markup=keyboard
+    )
+
+
 async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
     if not context.args:
         await update.message.reply_text(
             "Usage:\n/register Name | Bio | Country | City | Occupation | Public groups/links\n\n"
             "Example:\n/register Sam | Website designer | Nigeria | Port Harcourt | Designer | @publicgroup"
         )
         return
-    p = [" ".join(context.args).split("|")[i].strip() if i < len(" ".join(context.args).split("|")) else ""
-         for i in range(6)]
-    name, bio, country, city, occupation, groups = p
+    fields = " ".join(context.args).split("|")
+    fields = [fields[i].strip() if i < len(fields) else "" for i in range(6)]
+    name, bio, country, city, occupation, groups = fields
+    user = update.effective_user
     name = name or user.full_name
     conn = db()
     conn.execute(
@@ -102,6 +154,7 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
     await update.message.reply_text("â Your profile has been saved.")
+
 
 async def addprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -121,7 +174,6 @@ async def addprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not username or not name:
         await update.message.reply_text("A username and display name are required.")
         return
-    # Use a stable negative internal key for manually added directory entries.
     conn = db()
     existing = conn.execute("SELECT user_id FROM profiles WHERE lower(username)=lower(?)", (username,)).fetchone()
     key = existing[0] if existing else -abs(hash(username)) % 2_000_000_000 - 1
@@ -140,12 +192,14 @@ async def addprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     await update.message.reply_text(f"â Saved @{username}. Search with /lookup {username}")
 
+
 async def myprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = db()
     row = conn.execute(f"SELECT {SELECT_FIELDS} FROM profiles WHERE user_id=?",
                        (update.effective_user.id,)).fetchone()
     conn.close()
     await update.message.reply_text(profile_text(row) if row else "No profile found. Use /register.")
+
 
 async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -158,7 +212,8 @@ async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         row = conn.execute(f"SELECT {SELECT_FIELDS} FROM profiles WHERE lower(username)=lower(?)", (term,)).fetchone()
     conn.close()
-    await update.message.reply_text(profile_text(row) if row else "No saved profile found.")
+    await update.message.reply_text(profile_text(row) if row else "No saved profile found. Try /publicsearch username for public web search links.")
+
 
 async def deleteprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = db()
@@ -167,18 +222,22 @@ async def deleteprofile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     await update.message.reply_text("ðï¸ Your profile has been deleted." if cur.rowcount else "You do not have a saved profile.")
 
+
 def main():
     if not TOKEN:
         raise RuntimeError("Set TELEGRAM_BOT_TOKEN in your environment.")
     app = Application.builder().token(TOKEN).build()
-    for command, handler in [
+    handlers = [
         ("start", start), ("help", help_cmd), ("myid", myid),
+        ("groupsearch", groupsearch), ("publicsearch", publicsearch),
         ("register", register), ("addprofile", addprofile),
         ("myprofile", myprofile), ("lookup", lookup),
-        ("deleteprofile", deleteprofile)
-    ]:
+        ("deleteprofile", deleteprofile),
+    ]
+    for command, handler in handlers:
         app.add_handler(CommandHandler(command, handler))
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
